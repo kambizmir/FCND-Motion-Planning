@@ -5,12 +5,36 @@ from enum import Enum, auto
 
 import numpy as np
 
-from planning_utils import a_star, heuristic, create_grid
+from planning_utils import a_star, heuristic, create_grid , probabilistic_a_star
 from udacidrone import Drone
 from udacidrone.connection import MavlinkConnection
 from udacidrone.messaging import MsgID
 from udacidrone.frame_utils import global_to_local
 
+import math
+from bresenham import bresenham
+
+
+###############################
+#Clay Battery intersection        
+coordinates1 = (-122.400865,37.795862)
+# near Main and Spear    
+coordinates2 = (-122.394496,37.792128)
+#Near Davis and Clay intersection    
+coordinates3 = (-122.397880,37.795450)
+#Market Front intersection         
+coordinates4 = (-122.398795,37.791446)
+#Center        
+coordinates5 = (-122.397450,37.792480)
+###############################
+
+#change this variable to one of the above coordinates and then run the program
+goal_coordinates = coordinates1
+
+use_probabilistic_roadmap = False
+use_helix = False
+
+###############################
 
 class States(Enum):
     MANUAL = auto()
@@ -20,7 +44,6 @@ class States(Enum):
     LANDING = auto()
     DISARMING = auto()
     PLANNING = auto()
-
 
 class MotionPlanning(Drone):
 
@@ -111,6 +134,79 @@ class MotionPlanning(Drone):
         data = msgpack.dumps(self.waypoints)
         self.connection._master.write(data)
 
+    def prune_path(self,path,grid):
+
+        result = []
+        flags = [0] * len(path)
+
+        for i , p in enumerate(path):
+            if flags[i] == 0:
+                for j , q in enumerate(path):                                    
+                    if j > i + 1: 
+                        pathClear = True
+                        if flags[j] == 0:                                                                           
+                            cells = list(bresenham(p[0], p[1], q[0], q[1]))
+                            for cell in cells:
+                                if grid[ cell[0],cell[1] ] == 1:
+                                    pathClear = False                                                                                
+                                    break
+
+                            if pathClear:
+                                #print("Path IS clear between " , p,q)
+                                for k in range(i+1,j):
+                                    flags[k] = 1
+
+        for i , f in enumerate(flags):
+            if f == 0:
+                result.append(path[i])
+
+        return result
+
+    def probabilistic_roadmap(self,grid_start,grid_goal):
+
+        TARGET_ALTITUDE = 5
+        SAFETY_DISTANCE = 5
+
+        SAMPLE_NUMBER =30
+
+        data = np.loadtxt('colliders.csv', delimiter=',', dtype='Float64', skiprows=2)            
+        grid, north_offset, east_offset = create_grid(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
+
+        print("random x" , np.random.choice(grid.shape[0],SAMPLE_NUMBER))
+        print("random y" , np.random.choice(grid.shape[1],SAMPLE_NUMBER))
+        
+
+        print("Generating random points")
+        random_points = [ (x,y) for x in np.random.choice(grid.shape[0],SAMPLE_NUMBER) for y in np.random.choice(grid.shape[1],SAMPLE_NUMBER)]
+        random_points.append(grid_start)
+        random_points.append(grid_goal)
+        print("random_points = ",random_points)
+        print("length of random_points = ",len(random_points))
+        
+        print("Filtering to free space points")
+        free_space_random_points = [ p for p in random_points if grid[p[0],p[1]] == 0 ]
+        print("free_space_random_points = " , free_space_random_points)
+        print("length of free_space_random_points = " , len(free_space_random_points))   
+
+        print("Generating valid actions map")
+        valid_actions_map ={}
+        for p in free_space_random_points:
+            valid_actions_map[p] = []
+
+        for p in free_space_random_points:
+            for q in free_space_random_points:
+                if p != q:
+                    pathClear = True
+                    cells = list(bresenham(p[0], p[1], q[0], q[1]))
+                    for cell in cells:
+                        if grid[ cell[0],cell[1] ] == 1:
+                            pathClear = False
+                            break
+                    if pathClear:
+                        valid_actions_map[p].append( [ q[0]-p[0] , q[1]-p[1] , np.sqrt( (q[0]-p[0])**2 +  (q[1]-p[1])**2  ) ] )
+        
+        return valid_actions_map
+
     def plan_path(self):
         self.flight_state = States.PLANNING
         print("Searching for a path ...")
@@ -120,12 +216,22 @@ class MotionPlanning(Drone):
         self.target_position[2] = TARGET_ALTITUDE
 
         # TODO: read lat0, lon0 from colliders into floating point values
-        
+        firstLine= np.genfromtxt('colliders.csv', dtype=str, delimiter=",", max_rows=1)
+        lat0 = float(firstLine[0].strip().strip("lat0"))
+        lon0 = float(firstLine[1].strip().strip("lon0"))
+            
         # TODO: set home position to (lon0, lat0, 0)
+        self.set_home_position(lon0, lat0, 0) 
 
         # TODO: retrieve current global position
- 
+        global_position = [self._longitude, self._latitude, self._altitude]
+        
         # TODO: convert to current local position using global_to_local()
+        local_p = global_to_local(global_position,self.global_home)
+        print(local_p)
+        self.local_position[0]=local_p[0]
+        self.local_position[1]=local_p[1]
+        self.local_position[2]=local_p[2]
         
         print('global home {0}, position {1}, local position {2}'.format(self.global_home, self.global_position,
                                                                          self.local_position))
@@ -135,24 +241,98 @@ class MotionPlanning(Drone):
         # Define a grid for a particular altitude and safety margin around obstacles
         grid, north_offset, east_offset = create_grid(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
         print("North offset = {0}, east offset = {1}".format(north_offset, east_offset))
-        # Define starting point on the grid (this is just grid center)
-        grid_start = (-north_offset, -east_offset)
-        # TODO: convert start position to current position rather than map center
         
-        # Set goal as some arbitrary position on the grid
-        grid_goal = (-north_offset + 10, -east_offset + 10)
-        # TODO: adapt to set goal as latitude / longitude position and convert
+        # Define starting point on the grid (this is just grid center)        
+        #grid_start = (-north_offset, -east_offset)
+        
+        # TODO: convert start position to current position rather than map center
+        grid_start = (int(local_p[0]-north_offset), int(local_p[1]-east_offset))
+        
+        # TODO: adapt to set goal as latitude / longitude position and convert  
+        goal_local_pos = global_to_local([goal_coordinates[0] , goal_coordinates[1],self.global_home[2]],self.global_home)      
+        grid_goal = (int(goal_local_pos[0]-north_offset), int(goal_local_pos[1]-east_offset))          
 
-        # Run A* to find a path from start to goal
-        # TODO: add diagonal motions with a cost of sqrt(2) to your A* implementation
-        # or move to a different search space such as a graph (not done here)
-        print('Local Start and Goal: ', grid_start, grid_goal)
-        path, _ = a_star(grid, heuristic, grid_start, grid_goal)
-        # TODO: prune path to minimize number of waypoints
+        
+        if use_probabilistic_roadmap:
+
+            import pickle        
+            file = open('free_space_random_points.pkl', 'rb')
+            free_space_random_points = pickle.load(file)
+            file.close()
+
+            file = open('valid_actions_map.pkl', 'rb')
+            valid_actions_map = pickle.load(file)
+            file.close()
+
+            for p in [grid_start,grid_goal]:
+                valid_actions_map[p] = []
+
+            for p in [grid_start,grid_goal]:
+                for q in free_space_random_points:
+                    if p != q:
+                        pathClear = True
+                        cells = list(bresenham(p[0], p[1], q[0], q[1]))
+                        for cell in cells:
+                            if grid[ cell[0],cell[1] ] == 1:
+                                pathClear = False
+                                break
+                        if pathClear:
+                            valid_actions_map[p].append( [ q[0]-p[0] , q[1]-p[1] , np.sqrt( (q[0]-p[0])**2 +  (q[1]-p[1])**2  ) ] )
+
+            for p in free_space_random_points:
+                for q in [grid_start,grid_goal]:
+                    if p != q:
+                        pathClear = True
+                        cells = list(bresenham(p[0], p[1], q[0], q[1]))
+                        for cell in cells:
+                            if grid[ cell[0],cell[1] ] == 1:
+                                pathClear = False
+                                break
+                        if pathClear:
+                            valid_actions_map[p].append( [ q[0]-p[0] , q[1]-p[1] , np.sqrt( (q[0]-p[0])**2 +  (q[1]-p[1])**2  ) ] )
+
+        
+            probabilistic_path , _ = probabilistic_a_star(valid_actions_map , heuristic , grid_start, grid_goal)
+            print(probabilistic_path)
+
+            path = list(probabilistic_path)    
+
+
+            #Added these lines to convert elements to int
+            #without this, there was some serializtion exeption when sending points to simulator
+            newPath = []
+            for p in path:
+                q=[int(i) for i in p]
+                newPath.append(q)
+            path =newPath
+
+        else:
+
+            # Run A* to find a path from start to goal
+            # TODO: add diagonal motions with a cost of sqrt(2) to your A* implementation
+            # or move to a different search space such as a graph (not done here)
+            print('Local Start and Goal: ', grid_start, grid_goal)
+            path, _ = a_star(grid, heuristic, grid_start, grid_goal)
+
+            # TODO: prune path to minimize number of waypoints
+            path = self.prune_path(path,grid)
+            #print("pruned path = " , path)
+
+        
         # TODO (if you're feeling ambitious): Try a different approach altogether!
-
         # Convert path to waypoints
         waypoints = [[p[0] + north_offset, p[1] + east_offset, TARGET_ALTITUDE, 0] for p in path]
+
+        #Consider heading
+        for i , w in enumerate( waypoints[2:-1] ):
+            waypoints[i][3] = np.arctan2( (waypoints[i][1]-waypoints[i-1][1]), (waypoints[i][0]-waypoints[i-1][0]) ) 
+
+        if use_helix:
+            waypoints = []
+            for t in np.arange(1,12.6,.1):
+                waypoints.append( [int(path[0][0] + north_offset + 15 * math.cos(t) ) , int(path[0][1] + east_offset + 15 * math.sin(t)) ,int( 5*t ) , 0 ] )
+        
+            
         # Set self.waypoints
         self.waypoints = waypoints
         # TODO: send waypoints to sim (this is just for visualization of waypoints)
@@ -182,3 +362,11 @@ if __name__ == "__main__":
     time.sleep(1)
 
     drone.start()
+
+
+
+
+
+
+
+
